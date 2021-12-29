@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use clap::{App, AppSettings, Arg};
 use num_cpus;
-use rayon::prelude::*;
+use rayon::spawn;
 use wireguard_vanity_lib::trial;
 
 fn estimate_one_trial() -> Duration {
@@ -93,6 +94,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .help("NAME must be found within first RANGE chars of pubkey (default: 10)"),
         )
         .arg(
+            Arg::with_name("MAX")
+                .long("max")
+                .takes_value(true)
+                .help("maximum number of keys to generate (default: 100)"),
+        )
+        .arg(
             Arg::with_name("NAME")
                 .required(true)
                 .help("string to find near the start of the pubkey"),
@@ -112,6 +119,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
     if end < len {
         return Err(ParseError(format!("range {} is too short for len={}", end, len)).into());
+    }
+
+    let max = match matches.value_of("MAX") {
+        Some(max) => max.parse()?,
+        None => 100,
+    };
+
+    if max <= 0 {
+        return Err(ParseError(format!("max {} is too small", max)).into());
     }
 
     let offsets: u64 = 44.min((1 + end - len) as u64);
@@ -159,11 +175,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("hit Ctrl-C to stop");
 
-    // 1M trials takes about 10s on my laptop, so let it run for 1000s
-    (0..100_000_000)
-        .into_par_iter()
-        .map(|_| trial(&prefix, 0, end))
-        .filter_map(|r| r)
-        .try_for_each(print)?;
+    let (tx, rx) = mpsc::channel();
+
+    for _ in 0..num_cpus::get() {
+        let tx = tx.clone();
+        let prefix = prefix.clone();
+        spawn(move || loop {
+            let r = trial(&prefix, 0, end);
+            if let Some(v) = r {
+                let _ = tx.send(v);
+            }
+        });
+    }
+
+    rx.iter().take(max).for_each(|res| print(res).unwrap());
+
     Ok(())
 }
